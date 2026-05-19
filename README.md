@@ -2,467 +2,543 @@
 
 ## 1. Введение
 
-«URL Shortener» — это высоконагруженный сервис сокращения ссылок, который позволяет пользователю преобразовать длинный URL в короткую ссылку и при переходе по ней мгновенно получить redirect на исходный адрес. Ключевая характеристика системы — резкий перекос нагрузки в сторону чтения (≈ 20 read на 1 write) и наличие «горячих» ссылок, по которым выполняется непропорционально большое число переходов.
+### 1.1. Что это и кому нужно
 
-Архитектура спроектирована с акцентом на **скорость отклика и пропускную способность редиректа** как на главный пользовательский опыт. Сознательно допускаются компромиссы в области сильной консистентности (статистика переходов — eventual consistency, кэш ссылок — TTL-устаревание на единицы секунд), поскольку их влияние на пользовательский опыт пренебрежимо мало, а выигрыш в латентности и стоимости решения — значителен.
+«URL Shortener» — сервис, превращающий длинный URL в короткую ссылку и выполняющий редирект по этой короткой ссылке. Классические примеры из реального мира — Bitly, TinyURL, `t.co` Twitter/X, `t.me/joinchat/...` Telegram, корпоративные шортенеры маркетинговых отделов.
+
+Типичные сценарии применения:
+
+- **Маркетинговые кампании.** Длинный URL с UTM-метками не помещается в SMS, на наружную рекламу, в QR-код. Маркетолог хочет получить ссылку быстро, а конечный пользователь — мгновенно попасть на сайт.
+- **QR-коды на печатных материалах.** Билборды, упаковка, чеки. Сама ссылка живёт годами, ходят по ней миллионами.
+- **Шеринг в мессенджерах и соцсетях.** Историческое ограничение Twitter в 140 символов, ограничения SMS, удобство «короткой» ссылки в чате.
+- **Внутренние корпоративные ссылки.** Reference на длинные URL внутри Confluence, дашбордов, монорепо.
+
+Общий паттерн нагрузки во всех этих сценариях один и тот же: **создаём редко, ходим часто**. Соотношение чтения к записи — 20:1 и хуже.
+
+### 1.2. На чём фокусируемся
+
+Главный пользовательский опыт — это **момент клика по короткой ссылке**. Пользователь не должен заметить, что между его кликом и открытием целевого сайта вообще что-то происходит. Поэтому решение оптимизируется по одной главной метрике:
+
+> **Минимальная и предсказуемая латентность редиректа при пиковых нагрузках 200k RPS на чтение.**
+
+Ради этой цели мы сознательно делаем компромиссы во всём, что пользователь напрямую не замечает: точность статистики, скорость распространения истечения ссылки, идемпотентность повторных запросов на создание и т. п. Эти компромиссы перечислены явно ниже.
+
+### 1.3. Ограничения по ресурсам разработки
+
+Решение проектируется в реалистичных условиях:
+
+- Команда 3–5 инженеров, MVP за квартал.
+- Бюджет инфраструктуры — десятки тысяч долларов в месяц, а не сотни. Никаких ML-сервисов, real-time аналитики, мульти-региональных active-active кластеров.
+- Используются стандартные компоненты, которые команда умеет эксплуатировать: PostgreSQL, Redis, NGINX/CDN. Никакой экзотики.
+- Никакого ClickHouse, Kafka, Cassandra и т. п. на старте — добавим, если действительно упрёмся в потолок.
+
+Это формирует архитектуру: **минимум движущихся частей, максимум кэширования**.
 
 ---
 
-## 2. Глоссарий
+## 2. Система гарантий и ограничений
+
+Перед погружением в детали явно фиксируем, что система гарантирует и от чего отказывается. Дальнейшие решения вытекают из этого контракта.
+
+### 2.1. Система гарантирует
+
+| # | Гарантия | Почему критично |
+|---|----------|-----------------|
+| G1 | **Корректность редиректа.** Если ссылка существует и не истекла — редирект ведёт ровно на тот URL, который ввёл создатель. | Иначе теряется доверие к сервису. |
+| G2 | **Сохранность созданных ссылок.** Подтверждённая создателем ссылка не теряется, пока не истёк её срок. | Маркетинговая кампания не должна «обвалиться». |
+| G3 | **Уникальность short_code.** Один код всегда указывает на ровно один URL за всё время жизни. | Иначе перепутаются переходы разных пользователей. |
+| G4 | **Низкая латентность редиректа.** P95 ≤ 50 мс на стороне сервиса. | Это и есть пользовательский опыт. |
+| G5 | **Доступность редиректа 99.99 %.** | Контур чтения важнее контура записи. |
+
+### 2.2. Система НЕ гарантирует (сознательные отказы)
+
+| # | Отказ | Что это значит на практике | Почему допустимо |
+|---|-------|----------------------------|------------------|
+| R1 | **Сильную консистентность статистики.** | Счётчик переходов может отставать на минуты от реального числа кликов. | Маркетолог смотрит дашборды раз в день; «±100 кликов» он не заметит. |
+| R2 | **Точный учёт каждого клика.** | Допускаем потерю ≤ 0.1 % кликов при сбое узла. | Никакая бизнес-логика не зависит от точного числа кликов. |
+| R3 | **Мгновенное истечение ссылки.** | После `expires_at` ещё до ~60 секунд может работать редирект (TTL кэша). | Маркетолог не указывает срок истечения с точностью до секунды. |
+| R4 | **Строгую идемпотентность создания.** | При сетевом ретрае на `POST /links` теоретически может создаться второй short_code для того же URL. | Создание ссылок — редкая операция; такая «небольшая утечка» в codes pool не критична. |
+| R5 | **Доступность создания 99.99 %.** | SLA контура записи — 99.9 %. | Маркетолог переживёт пару минут даунтайма создания, конечный пользователь — нет. |
+| R6 | **Детальную аналитику.** | Только `total_clicks`, без geo/device/referrer. | Это уже следующий продукт. |
+| R7 | **Кастомные домены, A/B, branded slugs.** | Только автогенерируемые коды на одном домене `sho.rt`. | Вне MVP. |
+
+Эта таблица — фундамент всех дальнейших решений. Когда возникает вопрос «а что если…», ответ ищем в ней: если случай покрыт R1–R7 — это сознательный компромисс, а не баг.
+
+---
+
+## 3. Глоссарий
 
 | Термин | Определение |
 | --- | --- |
-| Original URL | Исходный длинный адрес, на который должен происходить переход. |
-| Short URL | Короткая ссылка, созданная системой, в формате `https://sho.rt/{short_code}`. |
-| Short code (slug) | Короткий уникальный идентификатор ссылки, 7–8 символов из base62-алфавита. |
-| Redirect | HTTP 301/302 перенаправление пользователя с короткой ссылки на исходный URL. |
-| Expiration time | Момент времени, после которого ссылка считается недействительной. |
-| Collision | Ситуация, когда двум разным запросам пытаются назначить один и тот же short code. |
-| Hot key | Очень популярная короткая ссылка, по которой выполняется непропорционально много переходов в единицу времени. |
-| Idempotency Key | Уникальный идентификатор запроса от клиента, позволяющий безопасно повторить запрос без создания дубликатов. |
-| Codes Pool | Предварительно сгенерированный пул свободных short_code, из которого приложение берёт коды атомарно. |
+| Original URL | Исходный длинный адрес. |
+| Short URL | Короткая ссылка вида `https://sho.rt/{short_code}`. |
+| Short code | Короткий идентификатор, 7 символов из base62-алфавита (`a–z`, `A–Z`, `0–9`). |
+| Redirect | HTTP 301/302 на исходный URL. |
+| Hot key | Очень популярный short_code, дающий аномально большую долю трафика. |
+| Codes Pool | Предсгенерированный пул свободных short_code, FIFO-очередь. |
 | TTL | Time-to-live для записи в кэше. |
-| CDN | Сеть распределённых edge-узлов, кэширующих ответы ближе к пользователю. |
+| L1 / L2 | Локальный (в памяти процесса) / распределённый (Redis) уровни кэша. |
 
 ---
 
-## 3. Функциональные требования
+## 4. Функциональные требования
 
-1. **Создание короткой ссылки.** Пользователь передаёт длинный URL и опционально срок действия, получает короткую ссылку. Поддерживаются HTTP/HTTPS ссылки.
-2. **Редирект по короткой ссылке.** При обращении к `GET /{short_code}` система выполняет HTTP redirect на исходный URL. Для несуществующих и истёкших ссылок возвращается 404.
-3. **Уникальность коротких идентификаторов.** Один `short_code` всегда указывает на ровно один исходный URL за всё время жизни.
-4. **Срок действия ссылки.** Поддерживаются бессрочные ссылки и ссылки с TTL; после истечения redirect не выполняется.
-5. **Базовая статистика.** По идентификатору ссылки можно получить общее число переходов. Допускается eventual consistency.
+ФТ намеренно минимальные:
 
-### Архитектурные принципы
+1. **Создание короткой ссылки.** `POST /links` принимает `original_url` и опциональный `expires_at`, возвращает `short_url`.
+2. **Редирект.** `GET /{short_code}` отдаёт HTTP 301 на исходный URL. Если ссылки нет или она истекла — 404.
+3. **Статистика.** `GET /links/{short_code}/stats` возвращает `total_clicks`. Eventual consistency допустима.
 
-1. **Read-first design.** Главный приоритет — латентность и доступность редиректа. Всё остальное (создание, статистика) допускает более высокие задержки и более слабые гарантии.
-2. **Pre-generated codes pool.** `short_code` не генерируется «на лету» во время записи, а берётся атомарно из заранее заполненного пула. Это убирает race condition на этапе создания и убирает retry-цикл из горячего пути записи.
-3. **Идемпотентность создания.** На уникальной паре `(user_hash, idempotency_key)` гарантируется отсутствие дубликатов. Повторный запрос возвращает ранее созданный short_code.
-4. **Immutable mapping.** После создания связь `short_code → original_url` не меняется. Это позволяет агрессивно кэшировать её на всех уровнях (вплоть до CDN).
+Всё остальное (юзеры, авторизация, кастомные slugs, аналитика) сознательно вне MVP.
 
 ---
 
-## 4. Нефункциональные требования
+## 5. Нефункциональные требования
 
-- **Высокие нагрузки (Highload Metric Targets):**
-  - Запись (создание ссылок): до **10 000 RPS** в пике.
-  - Чтение (редиректы): до **200 000 RPS** в пике.
-  - Соотношение read/write: ≈ **20:1** — read-heavy профиль.
-  - Наличие «горячих» ссылок: одна ссылка может давать до 10–20 % всего трафика.
-- **Производительность (P95 Latency):**
-  - Редирект: **≤ 50 мс** на стороне сервиса (без учёта загрузки конечного сайта).
-  - Создание ссылки: **≤ 100 мс**.
-  - Чтение статистики: **≤ 150–200 мс**.
-- **Доступность:**
-  - Контур редиректа: **99.99 %** (приоритетный SLA).
-  - Контур создания и статистики: **99.9 %**.
-- **Надёжность и корректность:**
-  - Отсутствие потери уже подтверждённых (созданных) ссылок.
-  - Идемпотентность при сетевых ретраях на создание.
-  - Один `short_code` не может ссылаться на два разных URL.
-- **Консистентность:**
-  - `short_code → original_url`: фиксируется надёжно, допустима задержка распространения по кэшам до **5 секунд** (TTL).
-  - Статистика переходов: **eventual consistency**, лаг до **минуты** допустим.
+| Метрика | Значение |
+|---|---|
+| RPS на запись | 10 000 пик |
+| RPS на редирект | 200 000 пик |
+| Read/Write | ≈ 20:1 |
+| P95 редирект | ≤ 50 мс |
+| P95 создание | ≤ 100 мс |
+| P95 статистика | ≤ 200 мс |
+| SLA редирект | 99.99 % |
+| SLA запись и статистика | 99.9 % |
 
 ---
 
-## 5. Пользовательские сценарии
+## 6. Основные компоненты и их функции
 
-### Сценарий: создание короткой ссылки
+Архитектура спроектирована так, чтобы её можно было поместить в одну схему и объяснить за 60 секунд. Всего 6 компонентов плюс CDN.
 
-1. Пользователь отправляет в API запрос `POST /links` с полем `original_url` и опциональным `expires_at`, прикладывая `Idempotency-Key`.
-2. Система выдаёт короткий идентификатор из пула, сохраняет соответствие.
-3. Пользователь получает в ответе `short_url` и метаданные.
+```mermaid
+graph LR
+  User[Браузер пользователя]
+  CDN[(CDN Edge)]
+  GW[API Gateway]
+  R[Redirect Service<br/>+ L1 LRU]
+  S[Shortener Service]
+  Redis[(Redis Cluster<br/>cache + counters)]
+  PG[(PostgreSQL<br/>sharded)]
+  W[Background Worker<br/>генерация кодов<br/>+ flush счётчиков]
 
-### Сценарий: переход по короткой ссылке
+  User -->|GET /code| CDN
+  CDN -.miss.-> GW
+  User -->|POST /links| GW
+  GW --> R
+  GW --> S
+  R --> Redis
+  R -.L1+L2 miss.-> PG
+  R -->|INCR counter| Redis
+  S --> Redis
+  S --> PG
+  W --> Redis
+  W --> PG
+```
 
-1. Пользователь открывает короткую ссылку в браузере: `GET https://sho.rt/{short_code}`.
-2. Система определяет исходный URL.
-3. Браузер пользователя получает HTTP 301/302 и переходит на исходный сайт.
-4. Если ссылка не существует или истекла — возвращается 404.
+| # | Компонент | Что делает | Что НЕ делает |
+|---|-----------|-----------|----------------|
+| 1 | **CDN** | Кэширует сам HTTP-ответ `301 Location: …` на edge-узлах на 60 секунд. Первая линия обороны от hot keys. | Не знает о бизнес-логике, не работает с БД. |
+| 2 | **API Gateway** | TLS-терминация, rate limiting на запись (защита от ботов), маршрутизация. | Не делает кэш — кэш лежит в CDN и в сервисах. |
+| 3 | **Redirect Service** | Только обслуживает `GET /{short_code}`. Имеет локальный L1 LRU-кэш на ~100k самых горячих ключей. При промахе ходит в Redis (L2), при промахе и там — в PostgreSQL. Делает `INCR` счётчика в Redis fire-and-forget. | Не пишет в PostgreSQL. Не агрегирует статистику. |
+| 4 | **Shortener Service** | Обслуживает `POST /links` и `GET /links/{code}/stats`. Берёт код из пула, пишет в PostgreSQL. Для статистики читает счётчик из Redis + метаданные из PG. | Не обслуживает редиректы. |
+| 5 | **Redis Cluster** | Три роли в одном кластере: (а) L2-кэш маппинга `short_code → original_url` с TTL=1ч, (б) счётчики кликов через атомарный `INCR`, (в) хвостовая очередь свободных кодов из пула. | Не источник правды. |
+| 6 | **PostgreSQL (sharded)** | Источник правды: маппинг ссылок и сам codes pool. Шардируется по `hash(short_code)`. | Не обслуживает hot-path редиректа напрямую — только при cache miss. |
+| 7 | **Background Worker** | Делает две скучные офлайн-задачи: (1) пополняет codes pool, генерируя новые коды; (2) раз в минуту сливает счётчики из Redis в PostgreSQL, чтобы не терять их насовсем. | Не участвует в обработке клиентских запросов. |
 
-### Сценарий: просмотр статистики
+**Что важно понимать про эту картинку:**
 
-1. Пользователь запрашивает `GET /links/{short_code}/stats`.
-2. Система возвращает общее число переходов и метаданные ссылки.
+- **Чтения и записи разделены физически:** Redirect Service и Shortener Service — это разные процессы, разные пулы машин, разные SLA. Уронить контур записи можно, контур чтения уронить нельзя.
+- **Между сервисами нет очередей и брокеров.** Никакой Kafka на старте. Если нужно «дотечь» данные из Redis в Postgres, это делает Background Worker по таймеру. Если данные потеряются — это R2, мы это допускаем.
+- **Postgres стоит за тремя слоями кэша** (CDN, L1, L2). К нему доходят буквально проценты исходных 200k RPS — основная работа Postgres это запись новых ссылок, а не редиректы.
+
+### 6.1. Уровень детализации каждого компонента
+
+Чтобы было понятно, где мы остановились в проработке и от чего отказались:
+
+| Компонент | Что проработано | От чего отказались (и почему) |
+|---|---|---|
+| CDN | Стандартный (Cloudflare/Fastly), cache на 60 сек на ответе редиректа | Свой edge-кластер — слишком дорого для MVP |
+| API Gateway | Простой NGINX или managed (AWS API GW) с rate limit | Свой gateway — не нужно |
+| Redirect Service | Stateless Go-сервис, L1 — обычная in-process LRU библиотека (например, `freecache`/`bigcache`) | Кастомный shared memory — оверкилл |
+| Shortener Service | Тот же стек, обычный CRUD | Свой алгоритм генерации кодов — заменён на пул (см. ниже) |
+| Redis | Один шардированный кластер на 3–6 узлов | Отдельные Redis под кэш и под счётчики — лишняя сложность |
+| PostgreSQL | 4–8 шардов с одной репликой каждый, по `hash(short_code)` | Кросс-шардовые транзакции, 2PC, distributed SQL (CockroachDB/Yugabyte) — нам не нужны: у нас один ключ доступа `short_code`, поэтому нет cross-shard операций в принципе |
+| Background Worker | Простой cron-подобный воркер | Сложный поток обработки событий, ClickHouse — отложим до v2 |
 
 ---
 
-## 6. Модель данных
+## 7. Пользовательские сценарии
 
-### 6.1. Основные сущности
+### 7.1. Переход по короткой ссылке (главный сценарий)
+
+1. Пользователь кликает на `https://sho.rt/aB3xZ9k`.
+2. Браузер делает GET на ближайший edge CDN.
+3. CDN в 60–80 % случаев отдаёт закэшированный `301 Location: …` без обращения к нашему бэкенду.
+4. Иначе запрос доезжает до Redirect Service, который смотрит сначала в L1 (in-memory), потом в L2 (Redis), потом в PostgreSQL.
+5. Пользователь получает 301 и попадает на исходный сайт.
+6. Параллельно (fire-and-forget) увеличивается счётчик в Redis.
+
+### 7.2. Создание короткой ссылки
+
+1. Клиент шлёт `POST /links {original_url, expires_at?}`.
+2. Shortener Service берёт следующий код из пула в Redis (`RPOP`).
+3. Вставляет запись в PostgreSQL.
+4. Возвращает `short_url`.
+
+### 7.3. Просмотр статистики
+
+1. Клиент шлёт `GET /links/aB3xZ9k/stats`.
+2. Shortener Service читает `total_clicks` из Redis-счётчика и метаданные из PostgreSQL.
+3. Возвращает результат. Допустим лаг с реальностью до минуты (R1).
+
+---
+
+## 8. Модель данных
+
+Модель данных сознательно простая: только **денормализованные таблицы**, никаких join-ов на горячем пути.
 
 ```mermaid
 erDiagram
     direction LR
     LINK {
-        short_code varchar PK "7-8 chars base62"
+        short_code varchar PK "7 chars base62"
         original_url text "длинный URL"
-        owner_hash varchar "анонимизированный id создателя"
         created_at timestamp
         expires_at timestamp "NULL = бессрочно"
-        idempotency_key varchar "UNIQUE с owner_hash"
     }
 
     CODES_POOL {
-        short_code varchar PK "доступный код"
+        short_code varchar PK "свободный код"
         generated_at timestamp
     }
 
     CLICK_COUNTER {
         short_code varchar PK
-        total_clicks bigint "обновляется асинхронно"
-        last_updated_at timestamp
-    }
-
-    CLICK_EVENT {
-        id bigint PK
-        short_code varchar
-        clicked_at timestamp
-        ts_bucket varchar "час/день для агрегации"
+        total_clicks bigint "обновляется воркером раз в минуту"
+        last_flushed_at timestamp
     }
 
     LINK ||--o| CLICK_COUNTER : "tracked by"
-    LINK ||--o{ CLICK_EVENT : "produces"
 ```
 
-1. **`LINK`** — иммутабельное соответствие `short_code → original_url`. Главная и единственная критичная таблица для редиректа. Может быть прочитана только по PK, что делает доступ всегда O(1) по индексу.
-2. **`CODES_POOL`** — пул заранее сгенерированных, ещё не использованных коротких кодов. Используется как очередь FIFO. Полностью убирает коллизии: код не назначается двум запросам, потому что каждый запрос получает строку из пула атомарно (`SELECT ... FOR UPDATE SKIP LOCKED` или `RPOP` в Redis).
-3. **`CLICK_COUNTER`** — денормализованный счётчик переходов, обновляемый асинхронно из потока кликов. Используется для быстрой выдачи статистики.
-4. **`CLICK_EVENT`** — поток событий кликов (хранится в аналитическом хранилище ClickHouse). Используется как источник для пересчёта счётчиков и для возможной будущей детальной аналитики.
+### 8.1. Что и где живёт
 
-### 6.2. Генерация short_code
+| Сущность | Где хранится | Зачем именно там |
+|---|---|---|
+| `LINK` (источник правды) | PostgreSQL, шардирование по `hash(short_code)` | Долгоживущие данные, нужны транзакции на создание, нужны индексы. |
+| `LINK` (горячая копия) | Redis L2: ключ `link:{short_code}` → `original_url`, TTL=1ч | Мгновенный read. |
+| `CODES_POOL` (мастер) | PostgreSQL, отдельная таблица | Источник правды о свободных кодах. |
+| `CODES_POOL` (рабочая очередь) | Redis LIST: `codes_pool` | Атомарный `RPOP` за O(1). |
+| `CLICK_COUNTER` (live) | Redis: ключ `clicks:{short_code}` через `INCR` | Атомарный инкремент за < 1 мс, выдерживает любые RPS. |
+| `CLICK_COUNTER` (durable) | PostgreSQL, таблица `click_counter` | Чтобы не потерять навсегда при перезагрузке Redis. |
 
-Кодогенератор работает **офлайн от горячего пути записи** и наполняет `CODES_POOL`. Это даёт три преимущества:
+### 8.2. Почему такая денормализация — это правильно
 
-- Запись `POST /links` не делает retry на коллизию — код уже уникален.
-- Можно «прогреть» пул заранее и пережить всплеск создания ссылок.
-- Алгоритм генерации можно менять (random base62 / counter+base62 / hash) без воздействия на основной сервис.
+- **Нет join-ов на hot path.** Редирект — это лукап по primary key. Точка.
+- **Маппинг иммутабельный.** После создания `LINK` его `original_url` не меняется. Это значит, что инвалидация кэша почти не нужна (только TTL по истечении ссылки).
+- **Счётчик в Redis отделён от строки `LINK`.** Если бы счётчик жил прямо в `LINK`, каждый клик обновлял бы строку — это упёрло бы PostgreSQL в потолок по RPS на запись.
 
-Используется **base62 (a–z, A–Z, 0–9)** длиной 7 символов:
-62⁷ ≈ 3.5 × 10¹² комбинаций. При 10 000 RPS на запись это десятилетия эксплуатации, и при заполнении даже 1 % пространства вероятность коллизии при случайной генерации остаётся пренебрежимо малой (~10⁻¹⁰), что делает выбор random base62 безопасным.
+### 8.3. Генерация short_code и пул
 
-### 6.3. Идемпотентность
+Алгоритм:
 
-На таблице `LINK` создаётся **Unique Constraint** на `(owner_hash, idempotency_key)`. При повторе запроса от клиента (сетевой retry) PostgreSQL вернёт ошибку дубликата, и приложение отдаст уже существующий `short_code`, не создавая новой записи. Также код, который был «зарезервирован» из пула под этот запрос, возвращается обратно в пул.
+1. Background Worker генерирует случайные строки длиной 7 символов в base62 (62⁷ ≈ 3.5 × 10¹² комбинаций).
+2. Проверяет, не использованы ли они (LEFT ANTI JOIN с `LINK` на батче).
+3. Кладёт валидные в таблицу `CODES_POOL` в Postgres и одновременно `LPUSH`-ит в Redis-список.
+4. Shortener Service в момент `POST /links` делает `RPOP` из Redis — получает гарантированно свободный код за O(1), без коллизий.
 
-### 6.4. Шардирование
+Что мы получаем:
 
-Главная таблица `LINK` шардируется **по hash(short_code)** на N шардов PostgreSQL.
+- **Никаких retry на коллизию в hot path записи.** Коллизионная проверка идёт офлайн.
+- **Детерминированная латентность создания.**
+- При неуспехе вставки в `LINK` (например, дубль `idempotency_key`, если мы потом такое добавим) — код можно вернуть в пул через `LPUSH`. Если код «утечёт» — это утечка из 3.5 трлн комбинаций, мы это переживём (R4).
 
-- **Почему по short_code, а не по user**: подавляющая часть нагрузки — это GET по short_code; роутинг на нужный шард тривиально вычисляется по самому ключу запроса без обращения к каталогу.
-- **Локальность чтения**: запрос на редирект никогда не делает cross-shard fanout.
-- **`CLICK_EVENT`** хранится отдельно — в ClickHouse, который сам распределяет данные по своему шардированному кластеру.
+### 8.4. Шардирование
+
+Шардируем только `LINK` по `hash(short_code)`. Это даёт три полезных свойства:
+
+- **Тривиальный роутинг:** клиент Postgres знает шард прямо из ключа запроса.
+- **Никаких cross-shard операций:** все запросы — это поинт-лукап по PK либо инсерт по PK.
+- **Простое горизонтальное расширение:** добавили шард — переехала часть ключей через consistent hashing.
+
+`CODES_POOL` и `CLICK_COUNTER` не шардируем — они маленькие и не требуют масштабирования отдельно.
 
 ---
 
-## 7. Архитектура (Highload Architecture)
+## 9. Архитектура
 
-Архитектура построена на разделении контуров записи и чтения и на агрессивном многоуровневом кэшировании. Контур редиректа максимально упрощён: фактически от запроса до ответа достаточно одного in-memory lookup при попадании в кэш.
-
-### Основные компоненты
-
-1. **CDN / Edge Cache** — кэширует ответы редиректа на edge-узлах. Большая часть «горячих» ссылок отдаётся прямо из CDN, никогда не доходя до бэкенда. Это первая и самая дешёвая линия обороны.
-2. **API Gateway** — точка входа. Делает rate limiting (защита от ботов на создание), TLS-терминацию, базовую аутентификацию для эндпоинтов записи.
-3. **Redirect Service** — stateless-сервис, обслуживающий только `GET /{short_code}`. Масштабируется горизонтально, имеет локальный in-memory LRU-кэш для самых горячих ключей (L1).
-4. **Shortener Service** — сервис создания ссылок. Работает с пулом кодов и записывает в `LINK`. Горячий путь не содержит retry-циклов.
-5. **Codes Generator (фоновый воркер)** — пополняет `CODES_POOL` в фоне, отслеживая глубину пула. При проседании размера пула ниже порога подкачивает новую партию (батч 10–50k кодов за раз).
-6. **Redis Cluster (L2 Cache)** — шардированный распределённый кэш для `short_code → original_url` с TTL ≈ 1 час. Шарится между всеми инстансами Redirect Service.
-7. **PostgreSQL (Sharded LINK DB)** — источник правды для маппинга. К нему обращаются только при L1+L2 miss.
-8. **Kafka** — транспорт для событий кликов (`CLICK_EVENT`) и для outbox-событий `LinkCreated`.
-9. **Stats Aggregator** — консумер Kafka, который агрегирует клики в `CLICK_COUNTER` и пишет сырой поток в ClickHouse.
-10. **ClickHouse** — аналитическое хранилище для `CLICK_EVENT`. Отвечает за тяжёлые агрегации и масштаб хранения.
+Архитектура с учётом всего вышесказанного:
 
 ```mermaid
 graph LR
   subgraph Client
-    UserBrowser[Браузер пользователя]
+    UserBrowser[Браузер]
     APIClient[API-клиент]
   end
 
   subgraph Edge
-    CDN[(CDN Edge Cache)]
+    CDN[(CDN Edge<br/>60s TTL)]
   end
 
-  subgraph Gateway
-    APIGateway[API Gateway / Rate Limiter]
+  subgraph Backend
+    GW[API Gateway<br/>+ rate limit]
+    Redir[Redirect Service<br/>+ L1 LRU 100k]
+    Short[Shortener Service]
+    Worker[Background Worker<br/>codes gen + flush]
   end
 
-  subgraph ReadPath["Read Path - редирект"]
-    RedirectSvc[Redirect Service<br/>+ L1 LRU in-memory]
-    RedisL2[(Redis Cluster L2)]
+  subgraph Data
+    Redis[(Redis Cluster<br/>cache + counters + pool)]
+    PG[(Sharded PostgreSQL<br/>LINK + COUNTER + POOL)]
   end
 
-  subgraph WritePath["Write Path - создание"]
-    ShortenerSvc[Shortener Service]
-    CodesGen[Codes Generator]
-    StatsAgg[Stats Aggregator]
-  end
+  UserBrowser -->|GET /code| CDN
+  CDN -.miss.-> GW
+  APIClient -->|POST /links<br/>GET /stats| GW
 
-  subgraph Persistence
-    LinkDB[(Sharded LINK DB<br/>PostgreSQL)]
-    Pool[(Codes Pool<br/>Redis/PG)]
-    Clickhouse[(ClickHouse<br/>CLICK_EVENT)]
-  end
+  GW --> Redir
+  GW --> Short
 
-  subgraph Queue
-    Kafka[[Kafka]]
-  end
+  Redir --> Redis
+  Redir -.miss.-> PG
+  Redir -->|INCR| Redis
 
-  UserBrowser -->|GET /short_code| CDN
-  CDN -.cache miss.-> APIGateway
-  APIClient -->|POST /links| APIGateway
+  Short --> Redis
+  Short --> PG
 
-  APIGateway --> RedirectSvc
-  APIGateway --> ShortenerSvc
-
-  RedirectSvc --> RedisL2
-  RedirectSvc -.L1+L2 miss.-> LinkDB
-  RedirectSvc -->|click event fire-and-forget| Kafka
-
-  ShortenerSvc --> Pool
-  ShortenerSvc --> LinkDB
-  CodesGen --> Pool
-
-  Kafka --> StatsAgg
-  StatsAgg --> Clickhouse
-  StatsAgg --> LinkDB
+  Worker --> Redis
+  Worker --> PG
 ```
 
-### 7.1. Многоуровневое кэширование как ключ к 200k RPS
+### 9.1. Многоуровневый кэш — главный «секретный соус»
 
-Поток обработки редиректа спроектирован так, чтобы при «горячем» состоянии система **не трогала ни PostgreSQL, ни Redis** на каждом редиректе:
+Поскольку маппинг иммутабелен (см. §8.2), мы можем кэшировать максимально агрессивно:
 
-| Уровень | Где | Что хранит | Время доступа | Hit rate |
-| --- | --- | --- | --- | --- |
-| L0 | CDN edge | full HTTP 301 response | 1–5 мс (RTT до edge) | до 60–80 % для топ-ссылок |
-| L1 | In-memory LRU в Redirect Service | `short_code → original_url` | < 1 мс | ≈ 85–95 % того, что доехало до бэкенда |
-| L2 | Redis Cluster | `short_code → original_url`, TTL=1h | 1–2 мс | ≈ 95 %+ от L1 miss |
-| L3 | PostgreSQL (Sharded) | source of truth | 5–20 мс | редкие промахи |
+| Уровень | Где | Время доступа | Hit rate | Эффект |
+|---|---|---|---|---|
+| L0 | CDN edge | 1–5 мс RTT | 60–80 % | Топ-ссылки никогда не доходят до бэкенда |
+| L1 | In-memory LRU (100k записей) | < 1 мс | 85–95 % от L0 miss | Защита Redis от hot key |
+| L2 | Redis Cluster, TTL 1ч | 1–2 мс | 95 %+ от L1 miss | Шаринг кэша между инстансами |
+| L3 | PostgreSQL | 5–20 мс | очень редко | Source of truth |
 
-Поскольку маппинг **иммутабельный**, инвалидация кэша почти не нужна. Единственный кейс инвалидации — истечение TTL ссылки: после `expires_at` запись помечается как `expired` и при следующем запросе кэши обновляются. До этого момента возможно отдать редирект ещё на короткое время после реального истечения — это явный компромисс в пользу скорости (см. §9).
+200 000 RPS на входе превращаются примерно в 200–2000 RPS на PostgreSQL — задача под силу одному скромному кластеру.
 
-### 7.2. Обработка hot keys
-
-Без специальной обработки одна «вирусная» ссылка может посадить один шард Redis. Решение:
-
-- **CDN кэширует ответ редиректа на 60 секунд** для всех ссылок. Для топ-ссылки это означает, что 99 % её трафика обслуживается на edge.
-- **L1 LRU в каждом инстансе Redirect Service** ёмкостью 100k записей. Топовые ключи фактически «прибиваются» в локальной памяти и никогда не уходят в Redis.
-- **Реплики Redis на чтение** в каждом шарде кластера.
-
-### 7.3. Запись кликов: fire-and-forget
-
-При редиректе Redirect Service **не ждёт** записи клика — он публикует событие в Kafka в режиме fire-and-forget (или с маленьким локальным batch-буфером) и сразу отдаёт 301 пользователю. В худшем случае при падении инстанса потеряется маленький буфер кликов — это допустимый компромисс, поскольку статистика всё равно `eventual consistency` и абсолютная точность не требуется (см. ФТ §3.5).
-
-### 7.4. Запись ссылок: атомарное взятие кода из пула
-
-Чтобы убрать race conditions на этапе создания, `Shortener Service` не генерирует код «на лету». Вместо этого:
-
-1. Атомарно достать код из `CODES_POOL` (`RPOP` в Redis, либо `DELETE … RETURNING` с `SKIP LOCKED` в PG).
-2. В транзакции БД вставить запись в `LINK`.
-3. Если `idempotency_key` уже был, поймать unique violation — вернуть существующий `short_code`, а взятый из пула код вернуть обратно (`LPUSH`).
-
-Это обеспечивает **корректность без блокировок** на самой `LINK` и без retry-циклов.
-
----
-
-## 8. Контракты API и Технические сценарии
-
-### 8.1. API
-
-| Метод | Путь | Описание |
-| --- | --- | --- |
-| `POST` | `/links` | Создать короткую ссылку. Заголовок `Idempotency-Key` обязателен. |
-| `GET` | `/{short_code}` | Редирект (HTTP 301/302). |
-| `GET` | `/links/{short_code}/stats` | Получить статистику. |
-
-### 8.2. Сценарий: редирект (200k RPS, главный hot path)
-
-```mermaid
-sequenceDiagram
-  autonumber
-  participant U as Браузер
-  participant CDN as CDN Edge
-  participant GW as API Gateway
-  participant R as Redirect Service<br/>(L1 LRU)
-  participant L2 as Redis L2
-  participant DB as Sharded LINK DB
-  participant K as Kafka
-
-  U->>CDN: GET /{short_code}
-  alt CDN hit (горячая ссылка)
-    CDN-->>U: 301 Location: original_url
-  else CDN miss
-    CDN->>GW: forward
-    GW->>R: GET /{short_code}
-    alt L1 hit
-      R-->>GW: 301 + Cache-Control: 60s
-    else L1 miss, L2 hit
-      R->>L2: GET short_code
-      L2-->>R: original_url
-      R->>R: put in L1
-      R-->>GW: 301 + Cache-Control: 60s
-    else L1 + L2 miss
-      R->>DB: SELECT FROM link WHERE short_code=?
-      DB-->>R: row or null
-      alt not found / expired
-        R-->>GW: 404
-      else found
-        R->>L2: SETEX short_code original_url 3600
-        R->>R: put in L1
-        R-->>GW: 301
-      end
-    end
-    GW-->>CDN: response
-    CDN->>CDN: cache for 60s
-    CDN-->>U: 301
-    R-)K: publish ClickEvent (fire-and-forget)
-  end
-```
-
-Ключевые свойства:
-
-- При hot key реальный бэкенд **вообще не трогается** — отвечает CDN.
-- При L1 hit ответ внутри бэкенда формируется за ~1 мс.
-- Запись клика **не блокирует** ответ пользователю.
-
-### 8.3. Сценарий: создание короткой ссылки
-
-```mermaid
-sequenceDiagram
-  autonumber
-  participant C as Client
-  participant GW as API Gateway
-  participant S as Shortener Service
-  participant Pool as Codes Pool
-  participant DB as Sharded LINK DB
-
-  C->>GW: POST /links {original_url, expires_at, Idempotency-Key}
-  GW->>S: forward
-  S->>Pool: RPOP next short_code
-  Pool-->>S: short_code = "aB3xZ9k"
-  S->>DB: INSERT INTO link (short_code, original_url, owner_hash, idempotency_key, expires_at)
-  alt success
-    DB-->>S: ok
-    S-->>GW: 201 Created {short_url}
-  else duplicate idempotency_key
-    DB-->>S: unique violation
-    S->>DB: SELECT short_code WHERE owner_hash=? AND idempotency_key=?
-    DB-->>S: existing short_code
-    S->>Pool: LPUSH вернуть неиспользованный код
-    S-->>GW: 200 OK {short_url}
-  end
-  GW-->>C: response
-```
-
-### 8.4. Сценарий: пополнение пула кодов (фоновый процесс)
-
-```mermaid
-sequenceDiagram
-  autonumber
-  participant T as Timer
-  participant G as Codes Generator
-  participant Pool as Codes Pool
-  participant DB as LINK DB (anti-collision check)
-
-  loop каждые N секунд / при просадке пула
-    T->>G: tick
-    G->>Pool: LLEN pool
-    Pool-->>G: current_size
-    alt current_size < threshold
-      G->>G: сгенерировать batch (10k random base62)
-      G->>DB: SELECT short_code FROM link WHERE short_code IN (batch)
-      DB-->>G: уже использованные (обычно 0)
-      G->>Pool: LPUSH valid codes
-    end
-  end
-```
-
-Anti-collision check выполняется **на пополнении пула**, а не в горячем пути записи. Это снимает с критического пути коллизионную проверку.
-
-### 8.5. Сценарий: учёт клика и обновление статистики (CQRS / eventual)
+### 9.2. Счётчики кликов: Redis INCR + периодический flush
 
 ```mermaid
 sequenceDiagram
   autonumber
   participant R as Redirect Service
-  participant K as Kafka
-  participant A as Stats Aggregator
-  participant CH as ClickHouse
-  participant DB as LINK DB (counter)
+  participant Cache as Redis
+  participant W as Background Worker
+  participant PG as PostgreSQL
 
-  R-)K: publish ClickEvent {short_code, ts}
-  K-)A: consume batch (e.g. 1000 events)
-  par
-    A->>CH: bulk INSERT click_event
-  and
-    A->>A: group by short_code, count
-    A->>DB: UPDATE click_counter SET total_clicks = total_clicks + N
-  end
+  Note over R,Cache: На каждый клик
+  R-)Cache: INCR clicks:{short_code}
+
+  Note over W,PG: Раз в 60 секунд
+  W->>Cache: SCAN clicks:*
+  Cache-->>W: список {short_code, current_value}
+  W->>PG: UPSERT click_counter SET total_clicks = total_clicks + delta
+  W->>Cache: DECRBY clicks:{short_code} delta
 ```
 
-Stats Aggregator работает батчами — это позволяет одной транзакцией обновить счётчик по тысячам кликов сразу, а не делать UPDATE на каждый клик.
+Почему это работает и почему этого достаточно:
 
-### 8.6. Сценарий: получение статистики
+- **`INCR` в Redis** — атомарная операция, латентность < 1 мс, не требует блокировок. Выдерживает 200k RPS легко.
+- **Flush раз в минуту** — это батч на тысячи короткодеев одним апдейтом в Postgres. Снимает с Postgres нагрузку write-heavy.
+- **Что если Redis упал** — потеряем не сохранённую часть счётчика (буквально кликов за последние 60 секунд по каждой ссылке). По R2 это допустимо.
+
+### 9.3. Hot keys
+
+Без специальной защиты одна «вирусная» ссылка может посадить один шард Redis. Защита трёхступенчатая:
+
+1. **CDN кэширует ответ редиректа на 60 секунд.** Для вирусной ссылки это значит, что 99 % её трафика обслуживается на edge.
+2. **L1 LRU в каждом инстансе Redirect Service** размером 100k записей. Топ-ключи прибиваются в локальной памяти.
+3. **Реплики Redis на чтение** на случай, если всё-таки упрёмся.
+
+В сумме: вирусная ссылка не «убивает» один Redis-шард, потому что до Redis-шарда её трафик почти не доходит.
+
+---
+
+## 10. Технические сценарии
+
+### 10.1. Редирект (главный hot path, 200k RPS)
 
 ```mermaid
 sequenceDiagram
   autonumber
-  participant C as Client
-  participant GW as API Gateway
-  participant S as Shortener Service
-  participant DB as LINK DB
+  participant U as Браузер
+  participant CDN as CDN
+  participant R as Redirect Service<br/>(L1)
+  participant Redis as Redis L2
+  participant PG as PostgreSQL
 
-  C->>GW: GET /links/{short_code}/stats
-  GW->>S: forward
-  S->>DB: SELECT * FROM link JOIN click_counter ON short_code
-  DB-->>S: data
-  S-->>GW: 200 OK {original_url, total_clicks, created_at}
-  GW-->>C: response
+  U->>CDN: GET /aB3xZ9k
+  alt CDN hit
+    CDN-->>U: 301 Location
+  else CDN miss
+    CDN->>R: forward
+    alt L1 hit
+      R-->>CDN: 301 + Cache-Control 60s
+    else L1 miss
+      R->>Redis: GET link:aB3xZ9k
+      alt L2 hit
+        Redis-->>R: original_url
+      else L2 miss
+        R->>PG: SELECT original_url, expires_at FROM link WHERE short_code=?
+        PG-->>R: row or null
+        alt found and not expired
+          R->>Redis: SETEX link:aB3xZ9k original_url 3600
+        else not found/expired
+          R-->>CDN: 404
+        end
+      end
+      R->>R: put in L1
+      R-->>CDN: 301 + Cache-Control 60s
+    end
+    CDN-->>U: 301
+    R-)Redis: INCR clicks:aB3xZ9k
+  end
 ```
 
+Свойства:
+
+- При hot key реальный бэкенд **не трогается совсем**.
+- При L1 hit ответ собирается за ≈ 1 мс.
+- `INCR` идёт **после** отправки ответа пользователю и **не блокирует** редирект.
+
+### 10.2. Создание ссылки
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as Клиент
+  participant S as Shortener Service
+  participant Pool as Redis (codes_pool)
+  participant PG as PostgreSQL
+
+  C->>S: POST /links {original_url, expires_at?}
+  S->>Pool: RPOP codes_pool
+  Pool-->>S: short_code = aB3xZ9k
+  S->>PG: INSERT INTO link (short_code, original_url, expires_at)
+  PG-->>S: ok
+  S-->>C: 201 {short_url: "https://sho.rt/aB3xZ9k"}
+```
+
+Без блокировок, без retry, без race conditions — потому что код «зарезервирован» в пуле раньше, чем пришёл запрос.
+
+### 10.3. Пополнение пула (Background Worker)
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant T as Timer (каждые N сек)
+  participant W as Worker
+  participant Pool as Redis codes_pool
+  participant PG as PostgreSQL
+
+  T->>W: tick
+  W->>Pool: LLEN codes_pool
+  Pool-->>W: current_size
+  alt current_size < threshold
+    W->>W: generate batch (10k random base62)
+    W->>PG: SELECT short_code FROM link WHERE short_code IN (batch)
+    PG-->>W: использованные (обычно 0)
+    W->>PG: INSERT INTO codes_pool (...)
+    W->>Pool: LPUSH valid codes
+  end
+```
+
+### 10.4. Сброс счётчиков (Background Worker)
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant T as Timer (каждые 60 сек)
+  participant W as Worker
+  participant Redis as Redis
+  participant PG as PostgreSQL
+
+  T->>W: tick
+  W->>Redis: SCAN clicks:*
+  Redis-->>W: [(short_code, delta), ...]
+  W->>PG: UPSERT click_counter ON CONFLICT add delta
+  W->>Redis: DECRBY clicks:* delta
+```
+
+### 10.5. Просмотр статистики
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant C as Клиент
+  participant S as Shortener Service
+  participant PG as PostgreSQL
+  participant Redis as Redis
+
+  C->>S: GET /links/aB3xZ9k/stats
+  S->>PG: SELECT * FROM link WHERE short_code=?
+  S->>PG: SELECT total_clicks FROM click_counter WHERE short_code=?
+  S->>Redis: GET clicks:aB3xZ9k (uncommitted delta)
+  S-->>C: {original_url, total_clicks = pg_total + redis_delta}
+```
+
+Возвращаем сумму закоммиченного счётчика и текущего «незалитого» дельты в Redis — получаем почти-реалтайм без рисков потери.
+
 ---
 
-## 9. Обоснование архитектурных решений и компромиссы
+## 11. Обоснование решений и компромиссы
 
-### 9.1. Почему такая архитектура
+### 11.1. Что в системе точно нужно (без чего никак)
 
-| Решение | Почему выбрано |
-| --- | --- |
-| **Разделение Redirect / Shortener Service** | Они имеют принципиально разные SLA (99.99 % vs 99.9 %), разные паттерны нагрузки (200k RPS read vs 10k RPS write) и разную ёмкость. Их раздельное масштабирование — самый дешёвый способ держать 200k RPS на чтение. |
-| **CDN + L1 + L2 кэш** | Иммутабельность маппинга позволяет кэшировать максимально агрессивно. Большая часть трафика обслуживается до того, как доходит до бэкенда. |
-| **Pre-generated Codes Pool** | Убирает retry-цикл и блокировки на горячем пути записи. Делает запись детерминированной по латентности. |
-| **Шардирование по hash(short_code)** | Запросы на чтение всегда идут на нужный шард по самому ключу — без каталога и без fanout. |
-| **Kafka + fire-and-forget на клики** | Развязывает критичный путь редиректа от записи статистики. Даже если ClickHouse временно недоступен — редиректы продолжают работать. |
-| **ClickHouse для CLICK_EVENT** | Линейная масштабируемость по объёму, быстрые агрегации. PostgreSQL такой профиль записи (десятки тысяч инсертов в секунду длинного потока) не вытянет экономично. |
+| Компонент | Без чего ломается |
+|---|---|
+| CDN edge cache | При hot key загибается весь бэкенд. Это самый дешёвый и самый эффективный слой. |
+| L1 in-memory кэш | Без него Redis становится узким местом по RPS и сети. |
+| Redis L2 | Без него каждый L1 miss бьёт в Postgres. |
+| Шардирование Postgres | Без него один Postgres не выдержит запись 10k RPS и поток cache-miss-ов. |
+| Codes pool | Без него запись имеет ретраи на коллизию → недетерминированная латентность. |
+| Background Worker для счётчиков | Без него либо теряются клики, либо Postgres ложится под 200k RPS write. |
 
-### 9.2. Сознательные компромиссы
+### 11.2. От чего сознательно отказались и почему
 
-| Компромисс | Что теряем | Что выигрываем | Почему допустимо |
-| --- | --- | --- | --- |
-| **Eventual consistency статистики** | До минуты лага в показанном значении total_clicks | Возможность батч-обновления и развязка с горячим путём | Пользователь не принимает решений на разнице в 100 кликов; точность «±1 мин» — норма для аналитики. |
-| **Fire-and-forget кликов** | Возможна потеря маленького буфера (~сотни кликов) при падении инстанса | -10–20 мс P95 на редиректе, отсутствие зависимости от Kafka | Статистика всё равно неточна по дизайну; для UX потеря 0.001 % кликов незаметна. |
-| **TTL-кэш до 1 часа** | После «истечения» ссылки ещё какое-то время может отдаваться 301 | Резкое снижение нагрузки на БД | Эксплуатационно безопасно (нет финансовых рисков); явно фиксируется в SLA. |
-| **L1 LRU в каждом инстансе** | Удвоение/утроение памяти по сравнению с одним общим кэшем | Полный отказ от сетевого hop для топ-ключей | Память дешевле сети при таких RPS. |
-| **301 redirect (а не 302)** | Браузер может закэшировать редирект и не сообщить нам о повторных переходах | Меньше нагрузки на сервис | Точное соответствие выбранной стратегии «eventual stats»; для критичной аналитики можно перейти на 302. |
-| **Round-robin / hash шардирование без переноса данных** | При добавлении шардов часть ключей нужно перебалансировать | Простота операционной модели | Используем consistent hashing на роутинге, чтобы минимизировать долю мигрирующих ключей. |
+| Отказались от | Что выиграли | Что потеряли | Компенсация |
+|---|---|---|---|
+| **Kafka между сервисами** | Меньше компонентов в эксплуатации, проще дебажить | Нет «магистрали» для будущих фич аналитики | Добавим, когда понадобится — нынешняя архитектура не блокирует этот апгрейд |
+| **ClickHouse для CLICK_EVENT** | Не нужно поддерживать второе хранилище | Нет детальной поклик-аналитики | Соответствует R6 — её и не требовалось |
+| **Stats Aggregator как отдельный сервис** | Меньше деплоев | Логика flush-а живёт в Background Worker | Они почти одинаковы по реализации |
+| **Идемпотентность создания** | Не нужно тащить unique-индекс по idempotency_key и логику дедупликации | Сетевой ретрай может создать «дубль»-ссылку | R4: утечка из 3.5 трлн кодов — допустима |
+| **Сильная консистентность счётчика** | Можно использовать Redis INCR и батч-flush | Лаг 1 мин в статистике | R1 — лаг допустим |
+| **Мульти-регион active-active** | В разы меньше операционной сложности | При фейле региона сервис недоступен в этом регионе | На MVP single-region достаточно для 99.99 % на чтение (CDN всё равно глобален) |
 
-### 9.3. Что сознательно НЕ делаем (для упрощения)
+### 11.3. Где платим за выбранную стратегию
 
-- Не делаем кастомные домены, A/B-тестирование, QR-генерацию — вне ФТ.
-- Не делаем детальную аналитику (geo, referrer, device) на MVP — только total_clicks. Расширяется без изменения архитектуры за счёт `CLICK_EVENT` в ClickHouse.
-- Не используем 2PC для cross-shard операций — все таблицы шардируются по одному ключу `short_code`, поэтому распределённых транзакций нет в принципе.
-- Не делаем active-active мульти-региональную репликацию — на этапе MVP single-region достаточно для целевых SLA.
+- **Память L1.** 100k записей × 200 байт × 12 инстансов ≈ 240 МБ суммарно — копейки.
+- **Дублирование данных** (LINK живёт в Postgres и в Redis, COUNTER живёт там же). Это сознательная цена за денормализацию и скорость.
+- **Возможная потеря ~0.1 % кликов при сбое Redis.** В нашем UX это незаметно.
+- **Лаг счётчика до 1 минуты.** Тоже незаметно для маркетингового сценария.
 
-### 9.4. Точки роста и узкие места
+### 11.4. Что мы получили в итоге
 
-- **Самое узкое место** — Redis L2 на запись (инвалидация при создании ссылки и заполнение). При 10k RPS на запись это легко тянется одним кластером Redis на 3–6 шардов.
-- **Следующее узкое место** — PostgreSQL на запись в `LINK`. Решается шардированием на 8–16 узлов и батч-инсертами при пакетном создании.
-- **Будущая горизонталь** — при росте >500k RPS на редирект имеет смысл вынести Redirect Service в edge-функции (Cloudflare Workers / Fastly Compute), где он будет жить прямо рядом с CDN.
+- Архитектура из **6 компонентов** + CDN. Любой инженер из команды разберётся за день.
+- Главная метрика (P95 редирект ≤ 50 мс при 200k RPS) достигается за счёт каскада кэшей.
+- Главный пользовательский опыт (мгновенный клик → открытие сайта) защищён трёхступенчато: CDN, L1, L2.
+- Создание ссылок детерминированно по латентности.
+- Статистика «достаточно точная» при минимальной нагрузке на БД.
+- Все сознательные компромиссы (R1–R7) — управляемые и описанные.
 
 ---
 
-## 10. Итоговая характеристика решения
+## 12. Что дальше (вне MVP)
 
-Решение спроектировано как **read-optimized highload система**, в которой основной пользовательский опыт — мгновенный редирект — обслуживается преимущественно edge-слоем и in-memory кэшем, а более «холодные» сценарии (создание ссылок, статистика) обслуживаются стандартными транзакционными и аналитическими хранилищами. Сознательные компромиссы в области строгой консистентности статистики и точности учёта кликов выбраны в пользу низкой латентности и операционной простоты, что соответствует характеру задачи URL Shortener.
+Если когда-нибудь понадобится больше, архитектура расширяется без переписывания:
+
+- **Детальная аналитика** → добавляется Kafka между Redirect Service и аналитическим хранилищем (ClickHouse), сам Redirect Service не меняется.
+- **Кастомные домены и branded slugs** → меняется только Shortener Service.
+- **Multi-region** → CDN уже глобален; Redis и Postgres получают read-replica в нужных регионах.
+- **Anti-abuse / phishing detection** → отдельный async-сервис проверяет URL при создании.
+
+Архитектура спроектирована так, чтобы её **расширение не требовало переделки hot path** редиректа — а именно этот hot path и есть продукт.
