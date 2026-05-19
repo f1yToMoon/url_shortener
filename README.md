@@ -85,7 +85,6 @@
 2. Редирект. `GET /{short_code}` отдаёт HTTP 301 на исходный URL. Если ссылки нет или она истекла — 404.
 3. Статистика. `GET /links/{short_code}/stats` возвращает `total_clicks`. Eventual consistency допустима.
 
-Юзеры, авторизация, кастомные slugs, аналитика вне MVP (R6, R7).
 
 ---
 
